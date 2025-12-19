@@ -38,6 +38,7 @@ class ArticleResponse(BaseModel):
 @router.get("/{recommendation_id}/article", response_model=ArticleResponse)
 async def get_recommendation_article(
     recommendation_id: str,
+    regenerate: bool = False,
     authorization: Optional[str] = Header(None)
 ):
     """
@@ -53,8 +54,8 @@ async def get_recommendation_article(
         
         recommendation = rec_result.data[0]
         
-        # 2. 如果已有文章，直接返回
-        if recommendation.get("article_html"):
+        # 2. 如果已有文章且不强制重新生成，直接返回
+        if recommendation.get("article_html") and not regenerate:
             return ArticleResponse(id=recommendation_id, article_html=recommendation["article_html"])
             
         # 3. 获取分析上下文 (Full Context)

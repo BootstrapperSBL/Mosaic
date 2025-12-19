@@ -8,6 +8,9 @@ from typing import Optional, Dict, Any
 import logging
 import json
 import asyncio
+import base64
+import httpx
+from urllib.parse import urlparse
 from datetime import datetime
 from app.database import supabase
 from app.services.deepseek import deepseek_service
@@ -62,6 +65,11 @@ async def process_analysis_task(task_id: str, upload_id: str, user_id: str):
         upload_data = upload_result.data[0]
         upload_type = upload_data["type"]
 
+        intermediate_results["original_content"] = {
+            "type": upload_type,
+            "content": upload_data.get("image_url") if upload_type == "image" else upload_data.get("content_text")
+        }
+
         # 更新进度: 20%
         intermediate_results["step_message"] = "正在准备内容..."
         supabase.table("async_tasks").update({
@@ -76,14 +84,42 @@ async def process_analysis_task(task_id: str, upload_id: str, user_id: str):
         visual_description = None
         extracted_text = None
         content_for_analysis = ""
+        deep_decode_result = {}
 
         if upload_type == "image":
-            # 图片分析
+            # 图片分析 - 下载并转换为 Base64 传输
             image_url = upload_data["image_url"]
-            vision_result = await deepseek_service.analyze_image(image_url, is_url=True)
+            logger.info(f"正在从 Supabase Storage 下载图片: {image_url}")
+            
+            try:
+                # 从 URL 中提取存储路径
+                # URL 格式通常为: .../storage/v1/object/public/uploads/{path}
+                # 我们假设 bucket 名字是 "uploads"
+                path = image_url.split("/uploads/")[-1]
+                
+                # 使用 Supabase 客户端直接下载文件内容
+                img_bytes = supabase.storage.from_("uploads").download(path)
+                
+                base64_image = base64.b64encode(img_bytes).decode('utf-8')
+            except Exception as e:
+                logger.error(f"从 Supabase 下载图片失败: {str(e)}")
+                # 如果 Supabase 下载失败，尝试回退到 HTTP 下载 (带 User-Agent)
+                logger.info("尝试回退到 HTTP 下载...")
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    headers = {"User-Agent": "Mosaic-Backend/1.0"}
+                    img_res = await client.get(image_url, headers=headers)
+                    img_res.raise_for_status()
+                    base64_image = base64.b64encode(img_res.content).decode('utf-8')
+            
+            # 第一步：使用简单 Prompt 获取原始 OCR 结果
+            logger.info("Step 1: 使用简单 Prompt 调用 DeepSeek-OCR")
+            vision_result = await deepseek_service.analyze_image(base64_image, is_url=False)
+            deep_decode_result = vision_result
 
             visual_description = vision_result.get("visual_description", "")
             extracted_text = vision_result.get("extracted_text", "")
+            
+            # 如果 OCR 模型返回了有效的描述，我们认为第一步成功
             content_for_analysis = f"{visual_description}\n{extracted_text}"
 
         elif upload_type == "url":
@@ -97,16 +133,18 @@ async def process_analysis_task(task_id: str, upload_id: str, user_id: str):
             
             # 使用 DeepSeek 分析文本内容
             visual_description = await deepseek_service.analyze_text_content(content_for_analysis)
+            deep_decode_result = {"visual_description": visual_description, "extracted_text": extracted_text}
 
         elif upload_type == "text":
             # 纯文本
             content_for_analysis = upload_data["content_text"]
+            extracted_text = content_for_analysis
             # 使用 DeepSeek 分析文本内容
             visual_description = await deepseek_service.analyze_text_content(content_for_analysis[:30000])
+            deep_decode_result = {"visual_description": visual_description, "extracted_text": extracted_text}
 
         intermediate_results["deep_decode"] = {
-            "visual_description": visual_description,
-            "extracted_text": extracted_text,
+            **deep_decode_result,
             "content_for_analysis": content_for_analysis
         }
         intermediate_results["step_message"] = "深度解析完成."
@@ -312,6 +350,7 @@ class AnalysisDetailResponse(BaseModel):
     full_context: Optional[Dict[str, Any]] = None
     status: str
     created_at: str
+    original_content: Optional[Dict[str, Any]] = None
 
 
 @router.get("/{analysis_id}", response_model=AnalysisDetailResponse)
@@ -330,7 +369,18 @@ async def get_analysis_details(
         if not result.data:
             raise HTTPException(status_code=404, detail="分析记录不存在或无权访问")
             
-        return result.data[0]
+        analysis_data = result.data[0]
+        
+        # 获取原始上传内容
+        upload_res = supabase.table("uploads").select("*").eq("id", analysis_data["upload_id"]).execute()
+        if upload_res.data:
+            upload = upload_res.data[0]
+            analysis_data["original_content"] = {
+                "type": upload["type"],
+                "content": upload.get("image_url") if upload["type"] == "image" else upload.get("content_text")
+            }
+            
+        return analysis_data
 
     except HTTPException:
         raise

@@ -15,12 +15,17 @@ interface MainContentProps {
 
 const analysisFetcher = (url: string) => api.get(url).then(response => {
   // Normalize data structure for AnalysisResult component
-  const data = response.data.full_context || {
+  let data = response.data.full_context || {
     deep_decode: {
       visual_description: response.data.visual_description,
       extracted_text: response.data.extracted_text
     },
     contextual_expand: response.data.intent_analysis
+  }
+
+  // Ensure original_content is present
+  if (response.data.original_content) {
+    data = { ...data, original_content: response.data.original_content }
   }
   return data
 })

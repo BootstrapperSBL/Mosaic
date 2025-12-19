@@ -1,4 +1,5 @@
 import axios from 'axios'
+import { supabase } from './supabase'
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
 
@@ -10,8 +11,11 @@ const api = axios.create({
 })
 
 // 添加请求拦截器，自动添加 token
-api.interceptors.request.use((config) => {
-  const token = localStorage.getItem('access_token')
+api.interceptors.request.use(async (config) => {
+  // 优先从 Supabase SDK 获取最新的 session (自动处理刷新)
+  const { data } = await supabase.auth.getSession()
+  const token = data.session?.access_token
+  
   if (token) {
     config.headers.Authorization = `Bearer ${token}`
   }
@@ -56,6 +60,10 @@ export interface AnalysisDetail {
   full_context?: any
   status: string
   created_at: string
+  original_content?: {
+    type: 'image' | 'url' | 'text'
+    content: string
+  }
 }
 
 export interface RecommendationTile {
@@ -159,8 +167,10 @@ export const recommendationsAPI = {
       action,
     }),
 
-  getArticle: (recommendationId: string) =>
-    api.get<ArticleResponse>(`/api/recommendations/${recommendationId}/article`),
+  getArticle: (recommendationId: string, regenerate = false) =>
+    api.get<ArticleResponse>(`/api/recommendations/${recommendationId}/article`, {
+      params: { regenerate }
+    }),
 }
 
 export const historyAPI = {

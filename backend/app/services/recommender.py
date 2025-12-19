@@ -4,9 +4,11 @@
 """
 import logging
 import asyncio
+import re
 from typing import List, Dict, Any, Optional, Tuple
 from app.services.search import search_service
 from app.services.deepseek import deepseek_service
+from app.services.image_gen import image_gen_service
 from app.database import supabase
 
 logger = logging.getLogger(__name__)
@@ -141,19 +143,71 @@ class RecommenderService:
             }
 
             import httpx
-            async with httpx.AsyncClient(timeout=120.0, trust_env=False) as client:
-                response = await client.post(
-                    f"{deepseek_service.base_url}/chat/completions",
-                    json=payload,
-                    headers=deepseek_service.headers
-                )
-                response.raise_for_status()
-                result = response.json()
+            
+            # Retry logic for robust generation
+            max_retries = 3
+            result = None
+            
+            for attempt in range(max_retries):
+                try:
+                    async with httpx.AsyncClient(timeout=300.0, trust_env=False) as client:
+                        response = await client.post(
+                            f"{deepseek_service.base_url}/chat/completions",
+                            json=payload,
+                            headers=deepseek_service.headers
+                        )
+                        response.raise_for_status()
+                        result = response.json()
+                        break # Success, exit loop
+                except httpx.TimeoutException:
+                    logger.warning(f"生成文章超时 (尝试 {attempt+1}/{max_retries})")
+                    if attempt == max_retries - 1:
+                        raise
+                    await asyncio.sleep(2) # Simple backoff
+                except Exception as api_err:
+                    logger.error(f"生成文章 API 调用失败 (尝试 {attempt+1}/{max_retries}): {str(api_err)}")
+                    if attempt == max_retries - 1:
+                        raise
+                    await asyncio.sleep(2)
+
+            if not result:
+                raise Exception("生成文章失败: 重试次数已耗尽")
 
             content = result["choices"][0]["message"]["content"]
             
             # 清理可能包含的 markdown 代码块标记
             content = content.replace("```html", "").replace("```", "").strip()
+            
+            # 5. 处理图片占位符
+            # 查找形如 <div ...>[图片占位符: 描述]</div> 的内容
+            pattern = re.compile(r'(<div[^>]*>\s*\[图片占位符:\s*(.*?)\]\s*</div>)', re.DOTALL)
+            matches = pattern.findall(content)
+            
+            if matches:
+                logger.info(f"文章中发现 {len(matches)} 个图片占位符，开始生成配图...")
+                user_id = recommendation.get("user_id")
+                
+                for full_match, description in matches:
+                    try:
+                        # 翻译提示词 (简单处理：假设 Qwen/Flux 能理解中文，或者让 image_service 处理)
+                        # 这里我们直接传入描述
+                        image_url = await image_gen_service.generate_image(description, user_id)
+                        
+                        # 构建 img 标签
+                        img_tag = (
+                            f'<figure class="mb-6">'
+                            f'<img src="{image_url}" alt="{description}" class="w-full h-auto rounded-lg shadow-md object-cover max-h-96" />'
+                            f'<figcaption class="text-center text-sm text-gray-500 mt-2">{description}</figcaption>'
+                            f'</figure>'
+                        )
+                        
+                        # 替换内容
+                        content = content.replace(full_match, img_tag)
+                        
+                    except Exception as img_err:
+                        logger.error(f"配图生成失败: {str(img_err)}")
+                        # 失败时保留原占位符或移除
+                        # content = content.replace(full_match, "") 
             
             return content
 

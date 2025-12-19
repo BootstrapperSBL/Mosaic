@@ -5,6 +5,7 @@ DeepSeek AI 服务
 import httpx
 import logging
 import base64
+import json
 from typing import Dict, Any, List, Optional
 from app.config import settings
 
@@ -53,21 +54,25 @@ class DeepSeekService:
                             image_content,
                             {
                                 "type": "text",
-                                "text": """请详细分析这张图片，并以 JSON 格式返回以下信息：
-1. visual_description: 图片的整体视觉描述（场景、物体、颜色、构图等）
-2. extracted_text: 图片中的所有文字内容（如果有）
-3. scene_type: 场景类型（如：游戏、购物、文章、社交媒体、设计作品等）
-4. main_subjects: 主要对象列表
-5. possible_intent: 用户可能感兴趣的方向（攻略、购买、学习、欣赏等）
-
-请直接返回 JSON，不要包含额外的解释文字。"""
+                                "text": "Describe this image in detail and extract all visible text. Please be thorough."
                             }
                         ]
                     }
                 ],
-                "temperature": 0.3,
-                "max_tokens": 1000
+                "temperature": 0.1,  # Lower temperature for more deterministic output
+                "max_tokens": 1024
             }
+
+            # 打印请求参数以便观察 (截断过长的图片数据)
+            safe_payload = json.loads(json.dumps(payload))
+            for msg in safe_payload["messages"]:
+                for content_item in msg["content"]:
+                    if content_item.get("type") == "image_url" and "image_url" in content_item:
+                        url = content_item["image_url"].get("url", "")
+                        if url.startswith("data:") and len(url) > 100:
+                            content_item["image_url"]["url"] = url[:50] + "...(truncated)..." + url[-50:]
+            
+            logger.info(f"--- DeepSeek OCR Request Payload ---\n{json.dumps(safe_payload, indent=2, ensure_ascii=False)}\n-----------------------------------")
 
             async with httpx.AsyncClient(timeout=60.0, trust_env=False) as client:
                 response = await client.post(
@@ -75,34 +80,36 @@ class DeepSeekService:
                     json=payload,
                     headers=self.headers
                 )
+                if response.status_code != 200:
+                    logger.error(f"DeepSeek API Error: {response.status_code} - {response.text}")
+                
                 response.raise_for_status()
                 result = response.json()
 
-            # 解析结果
-            content = result["choices"][0]["message"]["content"]
-            logger.info(f"DeepSeek-OCR 分析完成: {content[:200]}...")
+            # log raw response for debugging
+            logger.info(f"DeepSeek Raw Response: {json.dumps(result, ensure_ascii=False)[:500]}...")
 
-            # 尝试解析 JSON
-            import json
-            try:
-                # Find the start and end of the JSON object
-                start_index = content.find('{')
-                end_index = content.rfind('}')
-                if start_index != -1 and end_index != -1:
-                    json_str = content[start_index:end_index+1]
-                    parsed_result = json.loads(json_str)
-                else:
-                    raise json.JSONDecodeError("No JSON object found", content, 0)
-            except json.JSONDecodeError:
-                # 如果不是标准 JSON，返回原始内容
-                logger.warning(f"Failed to parse JSON from DeepSeek OCR response: {content}")
-                parsed_result = {
-                    "visual_description": content,
-                    "extracted_text": "",
-                    "scene_type": "unknown",
-                    "main_subjects": [],
-                    "possible_intent": []
-                }
+            # 解析结果
+            if not result.get("choices") or len(result["choices"]) == 0:
+                raise Exception(f"API returned no choices: {result}")
+                
+            content = result["choices"][0]["message"]["content"]
+            if not content:
+                 logger.error("DeepSeek returned empty content")
+                 content = ""
+                 
+            # 打印完整的原始返回内容以便观察
+            logger.info(f"--- DeepSeek OCR Original Content START ---\n{content}\n--- DeepSeek OCR Original Content END ---")
+
+            # 尝试从纯文本描述中“模拟”出 visual_description 和 extracted_text
+            # 因为我们使用了简单 Prompt，返回的将是纯文本
+            parsed_result = {
+                "visual_description": content,
+                "extracted_text": "", # 简单 Prompt 下文字通常包含在描述中
+                "scene_type": "auto-detected",
+                "main_subjects": [],
+                "possible_intent": []
+            }
 
             return parsed_result
 
@@ -145,7 +152,7 @@ class DeepSeekService:
                 "max_tokens": 2000
             }
 
-            async with httpx.AsyncClient(timeout=60.0, trust_env=False) as client:
+            async with httpx.AsyncClient(timeout=120.0, trust_env=False) as client:
                 response = await client.post(
                     f"{self.base_url}/chat/completions",
                     json=payload,
@@ -223,7 +230,7 @@ class DeepSeekService:
                 "max_tokens": 1500
             }
 
-            async with httpx.AsyncClient(timeout=60.0, trust_env=False) as client:
+            async with httpx.AsyncClient(timeout=120.0, trust_env=False) as client:
                 response = await client.post(
                     f"{self.base_url}/chat/completions",
                     json=payload,
@@ -237,7 +244,6 @@ class DeepSeekService:
             logger.info(f"DeepSeek-V3.2 意图分析完成: {content[:200]}...")
 
             # 尝试解析 JSON
-            import json
             try:
                 # Find the start and end of the JSON object
                 start_index = content.find('{')

@@ -20,10 +20,29 @@ export default function RecommendationGrid({ analysisId }: RecommendationGridPro
   const [modalTitle, setModalTitle] = useState('')
   const [articleHtml, setArticleHtml] = useState('')
   const [articleLoading, setArticleLoading] = useState(false)
+  const [currentRecId, setCurrentRecId] = useState<string | null>(null)
 
   useEffect(() => {
     loadRecommendations()
   }, [analysisId])
+  
+  const handleRegenerate = async () => {
+    if (!currentRecId) return
+    setArticleLoading(true)
+    try {
+        const response = await recommendationsAPI.getArticle(currentRecId, true)
+        setArticleHtml(response.data.article_html)
+        
+        // 更新本地状态缓存
+        setRecommendations(prev => 
+          prev.map(r => r.id === currentRecId ? { ...r, article_html: response.data.article_html } : r)
+        )
+    } catch (error: any) {
+        alert(`重新生成失败: ${error.response?.data?.detail || error.message}`)
+    } finally {
+        setArticleLoading(false)
+    }
+  }
 
   const loadRecommendations = async () => {
     setLoading(true)
@@ -38,7 +57,7 @@ export default function RecommendationGrid({ analysisId }: RecommendationGridPro
       setLoading(false)
     }
   }
-
+  
   const handleFeedback = async (recommendationId: string, action: 'keep' | 'discard') => {
     try {
       const response = await recommendationsAPI.feedback(recommendationId, action)
@@ -60,11 +79,12 @@ export default function RecommendationGrid({ analysisId }: RecommendationGridPro
       alert(`反馈失败: ${error.response?.data?.detail || error.message}`)
     }
   }
-  
+
   const handleReadArticle = async (recommendationId: string) => {
     const rec = recommendations.find(r => r.id === recommendationId)
     if (!rec) return
     
+    setCurrentRecId(recommendationId)
     setModalTitle(rec.title)
     setArticleHtml('') // 清空之前的
     setModalOpen(true)
@@ -147,6 +167,7 @@ export default function RecommendationGrid({ analysisId }: RecommendationGridPro
         title={modalTitle}
         contentHtml={articleHtml}
         isLoading={articleLoading}
+        onRegenerate={handleRegenerate}
       />
     </div>
   )
